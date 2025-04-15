@@ -2,10 +2,12 @@ import json
 import random
 import re
 import time
+import threading
 
 import requests
-from tooldelta import Plugin, plugin_entry, cfg, utils, fmts, TYPE_CHECKING
+from tooldelta import Plugin, plugin_entry, cfg, utils, fmts, Player, TYPE_CHECKING
 from tooldelta.constants import PacketIDS
+from tooldelta.utils import tempjson
 
 
 # 插件主类
@@ -198,7 +200,7 @@ class BattleEye(Plugin):
 
         # 这是获取玩家设备号函数的线程锁，要求当多个玩家连续登录时逐个获取设备号，而不是连续tp最后啥也没得到
         # 当任意玩家进入游戏后，线程锁将变为False，其他device_id线程处于等待状态，直到获取到当前玩家设备号或超时后再执行下一个线程
-        self.thread_lock_by_get_device_id = True
+        self.thread_lock_by_get_device_id = threading.Lock()
 
         self.ListenPreload(self.on_preload)
         self.ListenActive(self.on_active)
@@ -206,6 +208,7 @@ class BattleEye(Plugin):
         self.ListenPacket(PacketIDS.IDPlayerList, self.on_PlayerList)
         # 监听Text数据包
         self.ListenPacket(PacketIDS.IDText, self.on_Text)
+        self.ListenPlayerJoin(self.on_player_join)
 
         # 创建异步计时器，用于刷新“检测发言频率”和“检测重复刷屏”的缓存
         if self.speak_speed_limit or self.repeat_message_limit:
@@ -251,6 +254,14 @@ class BattleEye(Plugin):
                 self.check_player_info(Username, GrowthLevels, packet)
 
         return False
+
+    def on_player_join(self, player: Player):
+        Username = player.name
+
+        if Username in self.whitelist:
+            return
+
+        self.check_player_by_device_id(Username)
 
     def on_Text(self, packet):
         # "TextType"=10:监听到命令执行反馈
@@ -709,6 +720,95 @@ class BattleEye(Plugin):
 
         else:
             print("警告：无法解析您输入的封禁时间")
+
+    # 玩家封禁函数封装(被封禁者再次加入游戏,通过device_id判断)
+    def check_player_by_device_id(self, player):
+        if not self.is_record_device_id:
+            return
+
+        try_time = 0
+        while True:
+            with self.thread_lock_by_get_device_id:
+                time.sleep(3.5)
+                self.game_ctrl.sendcmd(
+                    f'/execute at "{player}" run tp "{self.bot_name}" ~ 320 ~'
+                )
+                time.sleep(0.5)
+                player_data = self.frame.launcher.omega.get_player_by_name(player)
+                try_time += 1
+                if player_data is None or (
+                    player_data and (device_id := player_data.device_id) == ""
+                ):
+                    if try_time >= self.record_device_id_try_time:
+                        fmts.print_inf(
+                            f"§c获取玩家 {player} 设备号失败，这可能是因为玩家进服后秒退或者玩家暂未完全进入服务器，当前尝试次数{try_time}/{self.record_device_id_try_time}，这是最后一次尝试"
+                        )
+                        break
+
+                    fmts.print_inf(
+                        f"§c获取玩家 {player} 设备号失败，这可能是因为玩家进服后秒退或者玩家暂未完全进入服务器，当前尝试次数{try_time}/{self.record_device_id_try_time}，将在4秒后再次尝试查询"
+                    )
+                    continue
+
+            fmts.print_inf(f"§b玩家 {player} 的 设备号: {device_id}")
+            xuid = self.xuid_getter.get_xuid_by_name(player, True)
+            path_device_id = f"{self.data_path}/玩家设备号记录.json"
+            device_id_record = tempjson.load_and_read(
+                path_device_id,
+                need_file_exists=False,
+                default={},
+                timeout=2,
+            )
+            if device_id not in device_id_record:
+                device_id_record[device_id] = {}
+
+            device_id_record[device_id][xuid] = player
+            tempjson.load_and_write(
+                path_device_id,
+                device_id_record,
+                need_file_exists=False,
+                timeout=2,
+            )
+            tempjson.flush(path_device_id)
+            tempjson.unload_to_path(path_device_id)
+
+            if not self.is_ban_player_by_device_id:
+                break
+
+            longest_ban_until_time = 0
+            longest_ban_reason = ""
+            timestamp_now = int(time.time())
+
+            for k, v in device_id_record.items():
+                # 非当前设备且非当前账号使用过的设备
+                if k != device_id and xuid not in v:
+                    continue
+
+                for x, n in v.items():
+                    if x == xuid:
+                        continue
+
+                    ban_record = self.ban_sys.get_ban_data(n)
+                    ban_until_time = ban_record["BanTo"]
+                    ban_reason = ban_record["Reason"]
+
+                    if ban_until_time != -1 and ban_until_time <= timestamp_now:
+                        continue
+
+                    if ban_until_time <= longest_ban_until_time:
+                        continue
+
+                    longest_ban_until_time = ban_until_time
+                    longest_ban_reason = ban_reason
+
+            if longest_ban_until_time <= 0:
+                break
+
+            # 同步账号状态
+            self.ban_sys.ban(
+                player, longest_ban_until_time - timestamp_now, longest_ban_reason
+            )
+            break
 
 
 entry = plugin_entry(BattleEye, "BattleEye")
