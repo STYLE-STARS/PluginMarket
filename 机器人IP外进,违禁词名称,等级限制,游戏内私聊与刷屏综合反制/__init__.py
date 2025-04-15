@@ -1,12 +1,11 @@
-from tooldelta import Plugin, plugin_entry, cfg, utils, fmts
-from tooldelta.constants import PacketIDS
-from tooldelta.utils import tempjson
-import time
 import json
-import re
-import os
-import requests
 import random
+import re
+import time
+
+import requests
+from tooldelta import Plugin, plugin_entry, cfg, utils, fmts, TYPE_CHECKING
+from tooldelta.constants import PacketIDS
 
 
 # 插件主类
@@ -201,8 +200,7 @@ class BattleEye(Plugin):
         # 当任意玩家进入游戏后，线程锁将变为False，其他device_id线程处于等待状态，直到获取到当前玩家设备号或超时后再执行下一个线程
         self.thread_lock_by_get_device_id = True
 
-        os.makedirs(f"{self.data_path}/玩家封禁时间数据", exist_ok=True)
-
+        self.ListenPreload(self.on_preload)
         self.ListenActive(self.on_active)
         # 监听PlayerList数据包
         self.ListenPacket(PacketIDS.IDPlayerList, self.on_PlayerList)
@@ -221,6 +219,13 @@ class BattleEye(Plugin):
 
             timer()
 
+    def on_preload(self):
+        self.ban_sys = self.GetPluginAPI("封禁系统")
+        if TYPE_CHECKING:
+            from 封禁系统 import BanSystem
+
+            self.ban_sys = self.get_typecheck_plugin_api(BanSystem)
+
     def on_active(self):
         self.bot_name = (
             self.frame.launcher.omega.get_bot_basic_info().BotName
@@ -228,9 +233,6 @@ class BattleEye(Plugin):
         self.xuid_getter = self.GetPluginAPI("XUID获取")
         fmts.print_inf(
             "§b如果您需要“禁止游戏内私聊(tell,msg,w命令)”，请将机器人踢出游戏后启用sendcommandfeedback，命令为/gamerule sendcommandfeedback true"
-        )
-        fmts.print_inf(
-            '§e如果您想要解封玩家，请删除"插件数据文件/机器人IP外进,违禁词名称,等级限制,游戏内私聊与刷屏综合反制/玩家封禁时间数据/XUID.json"；如果您想要修改玩家封禁时间，请修改文件中的"ban_until_timestamp"，这是封禁结束时的时间戳，代表(UTC)1970年1月1日至此时的总秒数，您可以在各种时间戳转换网站上得到您需要的时间戳！注意，修改文件中的日期是无效的，您必须修改时间戳！'
         )
 
     def on_PlayerList(self, packet):
@@ -247,8 +249,8 @@ class BattleEye(Plugin):
                 self.ban_player_with_netease_banned_word(Username)
                 self.ban_player_with_self_banned_word(Username)
                 self.check_player_info(Username, GrowthLevels, packet)
-                self.ban_player_when_PlayerList_by_xuid(Username)
-                self.ban_player_when_PlayerList_by_device_id(Username)
+
+        return False
 
     def on_Text(self, packet):
         # "TextType"=10:监听到命令执行反馈
@@ -639,362 +641,74 @@ class BattleEye(Plugin):
     # 格式化玩家封禁时间并开始执行封禁
     def ban_time_format_and_first_execute(self, player, ban_time, ban_reason):
         # ban_time == 0:仅踢出游戏，不作封禁，玩家可以立即重进
-        if ban_time != 0:
-            xuid = self.xuid_getter.get_xuid_by_name(player, True)
-            timestamp_now = int(time.time())
-            date_now = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp_now))
-            path = f"{self.data_path}/玩家封禁时间数据/{xuid}.json"
-            ban_player_data = tempjson.load_and_read(
-                path, need_file_exists=False, timeout=2
-            )
-
-            if ban_player_data is None:
-                pre_ban_timestamp = timestamp_now
-            else:
-                pre_ban_timestamp = ban_player_data["ban_until_timestamp"]
-
-            if pre_ban_timestamp == "Forever":
-                return
-
-            # ban_time == -1:永久封禁
-            if ban_time == -1:
-                tempjson.load_and_write(
-                    path,
-                    {
-                        "xuid": xuid,
-                        "name": player,
-                        "ban_start": date_now,
-                        "ban_start_timestamp": timestamp_now,
-                        "ban_until": "Forever",
-                        "ban_until_timestamp": "Forever",
-                        "ban_reason": ban_reason,
-                    },
-                    need_file_exists=False,
-                    timeout=2,
-                )
-                tempjson.flush(path)
-                tempjson.unload_to_path(path)
-
-            # type(ban_time) is int and ban_time > 0:封禁玩家对应时间(单位:秒)
-            elif type(ban_time) is int and ban_time > 0:
-                timestamp_until = pre_ban_timestamp + ban_time
-                date_until = time.strftime(
-                    "%Y-%m-%d %H:%M:%S", time.localtime(timestamp_until)
-                )
-                tempjson.load_and_write(
-                    path,
-                    {
-                        "xuid": xuid,
-                        "name": player,
-                        "ban_start": date_now,
-                        "ban_start_timestamp": timestamp_now,
-                        "ban_until": date_until,
-                        "ban_until_timestamp": timestamp_until,
-                        "ban_reason": ban_reason,
-                    },
-                    need_file_exists=False,
-                    timeout=2,
-                )
-                tempjson.flush(path)
-                tempjson.unload_to_path(path)
-
-            # type(ban_time) is str:封禁时间为字符串，将尝试进行转换
-            elif type(ban_time) is str:
-                ban_time = ban_time.replace(" ", "")
-                matches_time_units = re.findall(r"(\d+)(年|月|日|时|分|秒)", ban_time)
-                if not matches_time_units:
-                    print(
-                        f"警告：封禁时间({ban_time})中无法匹配到任何时间单位，合法的时间单位为(年|月|日|时|分|秒)"
-                    )
-                    return
-
-                ban_time_after_matched = "".join(
-                    f"{value}{unit}" for value, unit in matches_time_units
-                )
-                if ban_time_after_matched != ban_time:
-                    print(f"警告：封禁时间({ban_time})中存在无法解析的字符")
-                    return
-
-                time_units = {}
-                for value_str, unit in matches_time_units:
-                    if unit in time_units:
-                        print(f"警告：封禁时间({ban_time})中存在重复的时间单位：{unit}")
-                        return
-                    try:
-                        value = int(value_str)
-                        if value < 0:
-                            print(f'警告：封禁时间({ban_time})中的"{value}"值为负数')
-                            return
-                    except ValueError as error:
-                        print(
-                            f"警告：封禁时间({ban_time})中存在无效的数值：{value_str} detail: {str(error)}"
-                        )
-                        return
-
-                    time_units[unit] = value
-
-                years = time_units.get("年", 0)
-                months = time_units.get("月", 0)
-                days = time_units.get("日", 0)
-                hours = time_units.get("时", 0)
-                minutes = time_units.get("分", 0)
-                seconds = time_units.get("秒", 0)
-
-                total_days = years * 360 + months * 30 + days
-                total_seconds = (
-                    (total_days * 86400) + hours * 3600 + minutes * 60 + seconds
-                )
-
-                timestamp_until = pre_ban_timestamp + total_seconds
-                date_until = time.strftime(
-                    "%Y-%m-%d %H:%M:%S", time.localtime(timestamp_until)
-                )
-                tempjson.load_and_write(
-                    path,
-                    {
-                        "xuid": xuid,
-                        "name": player,
-                        "ban_start": date_now,
-                        "ban_start_timestamp": timestamp_now,
-                        "ban_until": date_until,
-                        "ban_until_timestamp": timestamp_until,
-                        "ban_reason": ban_reason,
-                    },
-                    need_file_exists=False,
-                    timeout=2,
-                )
-                tempjson.flush(path)
-                tempjson.unload_to_path(path)
-
-            else:
-                print("警告：无法解析您输入的封禁时间")
-
-    # 玩家封禁函数封装(被封禁者再次加入游戏,通过xuid判断)
-    def ban_player_when_PlayerList_by_xuid(self, player):
-        xuid = self.xuid_getter.get_xuid_by_name(player, True)
-        path = f"{self.data_path}/玩家封禁时间数据/{xuid}.json"
-        try:
-            ban_player_data = tempjson.load_and_read(
-                path, need_file_exists=True, timeout=2
-            )
-            tempjson.unload_to_path(path)
-            if ban_player_data is None:
-                os.remove(path)
-                return
-            ban_until_timestamp = ban_player_data["ban_until_timestamp"]
-            ban_reason = ban_player_data["ban_reason"]
-            if type(ban_until_timestamp) is int:
-                ban_until_date = time.strftime(
-                    "%Y-%m-%d %H:%M:%S", time.localtime(ban_until_timestamp)
-                )
-                timestamp_now = int(time.time())
-                if ban_until_timestamp > timestamp_now:
-                    fmts.print_inf(
-                        f"§c发现 {player} 被封禁，正在踢出，其解封时间为：{ban_until_date}"
-                    )
-                    self.game_ctrl.sendwocmd(
-                        f'/kick "{player}" 由于{ban_reason}，您被系统封禁至：{ban_until_date}'
-                    )
-                    fmts.print_inf(f"§a发现 {player} 被封禁，已被踢出游戏")
-                else:
-                    os.remove(path)
-            elif ban_until_timestamp == "Forever":
-                fmts.print_inf(f"§c发现 {player} 被封禁，正在踢出，该玩家为永久封禁")
-                self.game_ctrl.sendwocmd(
-                    f'/kick "{player}" 由于{ban_reason}，您被系统封禁至：Forever'
-                )
-                fmts.print_inf(f"§a发现 {player} 被封禁，已被踢出游戏")
-        except FileNotFoundError:
+        if ban_time == 0:
             return
 
-    # 玩家封禁函数封装(被封禁者再次加入游戏,通过device_id判断)
-    def ban_player_when_PlayerList_by_device_id(self, player):
-        if self.is_record_device_id:
-            while True:
-                if self.thread_lock_by_get_device_id:
-                    self.thread_lock_by_get_device_id = False
-                    try_time = 0
-                    while True:
-                        time.sleep(3.5)
-                        self.game_ctrl.sendwocmd(
-                            f'/execute at "{player}" run tp "{self.bot_name}" ~ 320 ~'
-                        )
-                        time.sleep(0.5)
-                        player_data = self.frame.launcher.omega.get_player_by_name(
-                            player
-                        )
-                        try_time += 1
-                        if player_data is None or (
-                            player_data and player_data.device_id == ""
-                        ):
-                            if try_time >= self.record_device_id_try_time:
-                                fmts.print_inf(
-                                    f"§c获取玩家 {player} 设备号失败，这可能是因为玩家进服后秒退或者玩家暂未完全进入服务器，当前尝试次数{try_time}/{self.record_device_id_try_time}，这是最后一次尝试"
-                                )
-                                break
-                            fmts.print_inf(
-                                f"§c获取玩家 {player} 设备号失败，这可能是因为玩家进服后秒退或者玩家暂未完全进入服务器，当前尝试次数{try_time}/{self.record_device_id_try_time}，将在4秒后再次尝试查询"
-                            )
-                        else:
-                            device_id = player_data.device_id
-                            fmts.print_inf(f"§b玩家 {player} 的 设备号: {device_id}")
-                            xuid = self.xuid_getter.get_xuid_by_name(player, True)
-                            path_device_id = f"{self.data_path}/玩家设备号记录.json"
-                            device_id_record = tempjson.load_and_read(
-                                path_device_id,
-                                need_file_exists=False,
-                                default={},
-                                timeout=2,
-                            )
-                            if device_id not in device_id_record:
-                                device_id_record[device_id] = {}
+        timestamp_now = int(time.time())
+        ban_player_data = self.ban_sys.get_ban_data(player)
+        pre_ban_time = ban_player_data["BanTo"]
 
-                            device_id_record[device_id][xuid] = player
-                            tempjson.load_and_write(
-                                path_device_id,
-                                device_id_record,
-                                need_file_exists=False,
-                                timeout=2,
-                            )
-                            tempjson.flush(path_device_id)
-                            tempjson.unload_to_path(path_device_id)
+        if pre_ban_time == -1:
+            return
+        elif pre_ban_time > timestamp_now:
+            pre_ban_time = pre_ban_time - timestamp_now
+        else:
+            pre_ban_time = 0
 
-                            if self.is_ban_player_by_device_id:
-                                for k, v in device_id_record.items():
-                                    if k == device_id:
-                                        for x, n in v.items():
-                                            if x != xuid:
-                                                try:
-                                                    path_ban_time = f"{self.data_path}/玩家封禁时间数据/{x}.json"
-                                                    ban_record = tempjson.load_and_read(
-                                                        path_ban_time,
-                                                        need_file_exists=True,
-                                                        timeout=2,
-                                                    )
-                                                    tempjson.unload_to_path(
-                                                        path_ban_time
-                                                    )
-                                                    if ban_record is None:
-                                                        os.remove(path_ban_time)
-                                                    else:
-                                                        ban_start = ban_record[
-                                                            "ban_start"
-                                                        ]
-                                                        ban_start_timestamp = (
-                                                            ban_record[
-                                                                "ban_start_timestamp"
-                                                            ]
-                                                        )
-                                                        ban_until = ban_record[
-                                                            "ban_until"
-                                                        ]
-                                                        ban_until_timestamp = (
-                                                            ban_record[
-                                                                "ban_until_timestamp"
-                                                            ]
-                                                        )
-                                                        ban_reason = ban_record[
-                                                            "ban_reason"
-                                                        ]
+        # isinstance(ban_time, int):封禁玩家对应时间(单位:秒)
+        if isinstance(ban_time, int):
+            time_until = pre_ban_time + ban_time
+            self.ban_sys.ban(player, time_until, ban_reason)
 
-                                                        if (
-                                                            type(ban_until_timestamp)
-                                                            is int
-                                                        ):
-                                                            ban_until_date = time.strftime(
-                                                                "%Y-%m-%d %H:%M:%S",
-                                                                time.localtime(
-                                                                    ban_until_timestamp
-                                                                ),
-                                                            )
-                                                            timestamp_now = int(
-                                                                time.time()
-                                                            )
-                                                            if (
-                                                                ban_until_timestamp
-                                                                > timestamp_now
-                                                            ):
-                                                                fmts.print_inf(
-                                                                    f"§c发现 {player} 被封禁且尝试开小号进入游戏 (设备号:{device_id},曾登录此设备的玩家:{n}) ，正在踢出，其解封时间为：{ban_until_date}"
-                                                                )
-                                                                self.game_ctrl.sendwocmd(
-                                                                    f'/kick "{player}" 由于{ban_reason}，您被系统封禁至：{ban_until_date}'
-                                                                )
-                                                                fmts.print_inf(
-                                                                    f"§a发现 {player} 被封禁且尝试开小号进入游戏 (设备号:{device_id},曾登录此设备的玩家:{n}) ，已被踢出游戏"
-                                                                )
-                                                                time.sleep(2)
-                                                                path_ban_player_by_device_id = f"{self.data_path}/玩家封禁时间数据/{xuid}.json"
-                                                                tempjson.load_and_write(
-                                                                    path_ban_player_by_device_id,
-                                                                    {
-                                                                        "xuid": xuid,
-                                                                        "name": player,
-                                                                        "ban_start": ban_start,
-                                                                        "ban_start_timestamp": ban_start_timestamp,
-                                                                        "ban_until": ban_until,
-                                                                        "ban_until_timestamp": ban_until_timestamp,
-                                                                        "ban_reason": ban_reason,
-                                                                    },
-                                                                    need_file_exists=False,
-                                                                    timeout=2,
-                                                                )
-                                                                tempjson.flush(
-                                                                    path_ban_player_by_device_id
-                                                                )
-                                                                tempjson.unload_to_path(
-                                                                    path_ban_player_by_device_id
-                                                                )
-                                                                break
+        # isinstance(ban_time, str):封禁时间为字符串，将尝试进行转换
+        elif isinstance(ban_time, str):
+            ban_time = ban_time.replace(" ", "")
+            matches_time_units = re.findall(r"(\d+)(年|月|日|时|分|秒)", ban_time)
+            if not matches_time_units:
+                print(
+                    f"警告：封禁时间({ban_time})中无法匹配到任何时间单位，合法的时间单位为(年|月|日|时|分|秒)"
+                )
+                return
 
-                                                            os.remove(path_ban_time)
+            ban_time_after_matched = "".join(
+                f"{value}{unit}" for value, unit in matches_time_units
+            )
+            if ban_time_after_matched != ban_time:
+                print(f"警告：封禁时间({ban_time})中存在无法解析的字符")
+                return
 
-                                                        elif (
-                                                            ban_until_timestamp
-                                                            == "Forever"
-                                                        ):
-                                                            fmts.print_inf(
-                                                                f"§c发现 {player} 被封禁且尝试开小号进入游戏 (设备号:{device_id},曾登录此设备的玩家:{n}) ，正在踢出，该玩家为永久封禁"
-                                                            )
-                                                            self.game_ctrl.sendwocmd(
-                                                                f'/kick "{player}" 由于{ban_reason}，您被系统封禁至：Forever'
-                                                            )
-                                                            fmts.print_inf(
-                                                                f"§a发现 {player} 被封禁且尝试开小号进入游戏 (设备号:{device_id},曾登录此设备的玩家:{n}) ，已被踢出游戏"
-                                                            )
-                                                            time.sleep(2)
-                                                            path_ban_player_by_device_id = f"{self.data_path}/玩家封禁时间数据/{xuid}.json"
-                                                            tempjson.load_and_write(
-                                                                path_ban_player_by_device_id,
-                                                                {
-                                                                    "xuid": xuid,
-                                                                    "name": player,
-                                                                    "ban_start": ban_start,
-                                                                    "ban_start_timestamp": ban_start_timestamp,
-                                                                    "ban_until": "Forever",
-                                                                    "ban_until_timestamp": "Forever",
-                                                                    "ban_reason": ban_reason,
-                                                                },
-                                                                need_file_exists=False,
-                                                                timeout=2,
-                                                            )
-                                                            tempjson.flush(
-                                                                path_ban_player_by_device_id
-                                                            )
-                                                            tempjson.unload_to_path(
-                                                                path_ban_player_by_device_id
-                                                            )
-                                                            break
+            time_units = {}
+            for value_str, unit in matches_time_units:
+                if unit in time_units:
+                    print(f"警告：封禁时间({ban_time})中存在重复的时间单位：{unit}")
+                    return
+                try:
+                    value = int(value_str)
+                    if value < 0:
+                        print(f'警告：封禁时间({ban_time})中的"{value}"值为负数')
+                        return
+                except ValueError as error:
+                    print(
+                        f"警告：封禁时间({ban_time})中存在无效的数值：{value_str} detail: {str(error)}"
+                    )
+                    return
 
-                                                except FileNotFoundError:
-                                                    continue
-                                        break
-                            break
+                time_units[unit] = value
 
-                    self.thread_lock_by_get_device_id = True
-                    break
+            years = time_units.get("年", 0)
+            months = time_units.get("月", 0)
+            days = time_units.get("日", 0)
+            hours = time_units.get("时", 0)
+            minutes = time_units.get("分", 0)
+            seconds = time_units.get("秒", 0)
 
-                time.sleep(1)
+            total_days = years * 360 + months * 30 + days
+            total_seconds = (total_days * 86400) + hours * 3600 + minutes * 60 + seconds
+
+            self.ban_sys.ban(player, total_seconds, ban_reason)
+
+        else:
+            print("警告：无法解析您输入的封禁时间")
 
 
 entry = plugin_entry(BattleEye, "BattleEye")
